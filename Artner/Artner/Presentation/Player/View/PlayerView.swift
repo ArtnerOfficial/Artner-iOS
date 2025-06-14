@@ -6,8 +6,6 @@
 //
 import UIKit
 import SnapKit
-import UIKit
-import SnapKit
 
 final class PlayerView: BaseView {
 

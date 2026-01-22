@@ -6,10 +6,12 @@
 //
 import AVFoundation
 
-final class PlayerViewModel {
+final class PlayerViewModel: NSObject {
 
     private let docent: Docent
     private var audioPlayer: AVAudioPlayer?
+    private var avPlayer: AVPlayer?
+    private var timeObserver: Any?
     private var isPlaying = false
     private var timer: Timer?
 
@@ -27,6 +29,9 @@ final class PlayerViewModel {
     
     // 로딩 상태 관리
     private var isLoading = true
+    
+    // API에서 가져온 duration (audioJobId가 있을 때 사용)
+    private var apiDuration: TimeInterval?
 
     // 외부 콜백들
     var onHighlightIndexChanged: ((Int) -> Void)?
@@ -37,12 +42,19 @@ final class PlayerViewModel {
     // 하이라이트 관련 콜백 추가
     var onHighlightSaved: ((TextHighlight) -> Void)?
     var onHighlightsLoaded: (([String: [TextHighlight]]) -> Void)?
+    var onShowUnderline: (() -> Void)?  // Underline 화면으로 이동 콜백
 
     init(docent: Docent) {
         self.docent = docent
+        super.init()
         // 데이터 로딩 시뮬레이션
         simulateDataLoading()
         prepareAudio()
+        
+        // audioJobId가 있으면 API에서 duration 가져오기
+        if let audioJobId = docent.audioJobId {
+            fetchAudioDuration(jobId: audioJobId)
+        }
         
         // 저장된 하이라이트 로드
         loadSavedHighlights()
@@ -54,6 +66,11 @@ final class PlayerViewModel {
             artist: docent.artist,
             description: docent.description
         )
+    }
+
+    /// 원본 Docent 객체 반환 (북마크 등 API 호출용)
+    func getRawDocent() -> Docent {
+        return docent
     }
     
     // MARK: - Public Interface
@@ -80,48 +97,136 @@ final class PlayerViewModel {
         onLoadingStateChanged?(false)
     }
 
-    // Implement updatePlayerState method
-    func updatePlayerState(_ isPlaying: Bool) {
-        // 플레이어 상태 업데이트 로직
-        // 예시: self.isPlaying = isPlaying
-    }
-
     // Implement saveHighlight method
     func saveHighlight(_ highlight: TextHighlight) {
         // 문단별 배열 초기화
         if savedHighlights[highlight.paragraphId] == nil {
             savedHighlights[highlight.paragraphId] = []
         }
-        
-        // 간단한 중복 방지: 동일 범위/텍스트가 이미 있으면 무시
-        let isDuplicate = savedHighlights[highlight.paragraphId]!.contains {
-            $0.startIndex == highlight.startIndex &&
-            $0.endIndex == highlight.endIndex &&
-            $0.highlightedText == highlight.highlightedText
+
+        // 완전히 동일한 범위가 있으면 무시
+        let isDuplicate = savedHighlights[highlight.paragraphId]!.contains { existing in
+            existing.startIndex == highlight.startIndex && existing.endIndex == highlight.endIndex
         }
-        if !isDuplicate {
-            savedHighlights[highlight.paragraphId]?.append(highlight)
-            saveHighlightsToStorage()
+
+        if isDuplicate {
+            print("⚠️ [ViewModel] 중복 하이라이트 - 저장 무시")
+            ToastManager.shared.showSimple("이미 하이라이트된 영역입니다")
+            return
         }
-        
-        // UI에 알림
+
+        // 겹치는 기존 하이라이트는 이미 NonEditableTextView에서 삭제 콜백을 호출했으므로
+        // 여기서는 단순히 추가만 함
+        savedHighlights[highlight.paragraphId]?.append(highlight)
+        saveHighlightsToStorage()
+
+        // 서버 API 연동 - 하이라이트 생성
+        createHighlightOnServer(highlight)
+
+        // Toast 표시 - 하이라이트 저장 완료 알림
+        showHighlightSavedToast(highlight: highlight)
+
+        // UI에 즉시 알림 (UI 업데이트 강제)
         onHighlightSaved?(highlight)
+    }
+
+    /// 서버에 하이라이트 생성 API 호출
+    private func createHighlightOnServer(_ highlight: TextHighlight) {
+        // item_type 결정: artist가 있으면 "artist", 없으면 "artwork"
+        let itemType = docent.artist.isEmpty ? "artwork" : "artist"
+        // item_info: 작가명 또는 추가 정보
+        let itemInfo = docent.artist.isEmpty ? docent.description : docent.artist
+
+        let payload = CreateHighlightRequestDTO(
+            itemType: itemType,
+            itemName: docent.title,
+            itemInfo: itemInfo,
+            highlightedText: highlight.highlightedText,
+            note: ""
+        )
+
+        APIService.shared.request(APITarget.createHighlight(payload: payload)) { [weak self] (result: Result<CreateHighlightResponseDTO, Error>) in
+            switch result {
+            case .success(let response):
+                print("✅ [API] 하이라이트 생성 성공: ID=\(response.serverId)")
+                // 서버 ID 저장 (String으로 변환된 값 사용)
+                self?.updateHighlightServerId(localId: highlight.id, serverId: response.serverId)
+            case .failure(let error):
+                print("❌ [API] 하이라이트 생성 실패: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 하이라이트의 서버 ID 업데이트
+    private func updateHighlightServerId(localId: String, serverId: String) {
+        for (paragraphId, highlights) in savedHighlights {
+            if let index = highlights.firstIndex(where: { $0.id == localId }) {
+                savedHighlights[paragraphId]?[index].serverId = serverId
+                saveHighlightsToStorage()
+                print("💾 [Storage] 하이라이트 서버 ID 저장: \(serverId)")
+                return
+            }
+        }
+    }
+    
+    /// 하이라이트 저장 완료 Toast 표시
+    private func showHighlightSavedToast(highlight: TextHighlight) {
+        let message = "하이라이트가 저장되었습니다"
+
+        // 저장된 하이라이트 목록으로 이동하는 액션
+        let viewAction = { [weak self] in
+            print("💡 [Toast] 저장된 하이라이트 보기 버튼 클릭됨")
+            // Underline 화면으로 이동
+            self?.onShowUnderline?()
+        }
+
+        ToastManager.shared.showSaved(message, viewAction: viewAction)
     }
     
     // 하이라이트 삭제
     func deleteHighlight(_ highlight: TextHighlight) {
+        print("🗑️ [ViewModel] 하이라이트 삭제 요청: ID=\(highlight.id), 문단=\(highlight.paragraphId)")
+
         // 해당 문단의 하이라이트 목록에서 제거
         if var paragraphHighlights = savedHighlights[highlight.paragraphId] {
+            let beforeCount = paragraphHighlights.count
             paragraphHighlights.removeAll { $0.id == highlight.id }
             savedHighlights[highlight.paragraphId] = paragraphHighlights
-            
+            let afterCount = paragraphHighlights.count
+
+            print("🗑️ [ViewModel] 삭제 전: \(beforeCount)개, 삭제 후: \(afterCount)개")
+
             // 스토리지에 저장
             saveHighlightsToStorage()
-            
-            // UI에 알림
-            onHighlightSaved?(highlight) // 같은 콜백 사용 (UI 업데이트 트리거)
-            
-            print("🗑️ [ViewModel] 하이라이트 삭제: \(highlight.id)")
+
+            // 서버 API 연동 - 하이라이트 삭제
+            deleteHighlightOnServer(highlight)
+
+            // UI에 즉시 알림 (UI 업데이트 트리거)
+            onHighlightSaved?(highlight)
+
+            print("🗑️ [ViewModel] 하이라이트 삭제 완료 및 UI 업데이트 트리거")
+        } else {
+            print("❌ [ViewModel] 해당 문단의 하이라이트를 찾을 수 없음")
+        }
+    }
+
+    /// 서버에서 하이라이트 삭제 API 호출
+    private func deleteHighlightOnServer(_ highlight: TextHighlight) {
+        // serverId가 있고 Int로 변환 가능할 때만 서버에 삭제 요청
+        guard let serverIdString = highlight.serverId,
+              let serverId = Int(serverIdString) else {
+            print("⚠️ [API] 서버 ID가 없어 삭제 요청 스킵 (로컬에서만 삭제)")
+            return
+        }
+
+        APIService.shared.request(APITarget.deleteHighlight(id: serverId)) { (result: Result<EmptyResponse, Error>) in
+            switch result {
+            case .success:
+                print("✅ [API] 하이라이트 삭제 성공: ID=\(serverId)")
+            case .failure(let error):
+                print("❌ [API] 하이라이트 삭제 실패: \(error.localizedDescription)")
+            }
         }
     }
     
@@ -178,6 +283,33 @@ final class PlayerViewModel {
         print("📂 [Storage] 하이라이트 로드 완료: \(highlights.count)개")
     }
     
+    /// API에서 오디오 duration 가져오기
+    /// - Parameter jobId: 오디오 job ID
+    private func fetchAudioDuration(jobId: String) {
+        print("📊 [PlayerViewModel] 오디오 duration 조회 시작 - jobId: \(jobId)")
+        
+        APIService.shared.request(APITarget.audioStatus(jobId: jobId)) { [weak self] (result: Result<AudioStatusDTO, Error>) in
+            guard let self = self else { return }
+            
+            switch result {
+            case .success(let statusDTO):
+                if let duration = statusDTO.duration, duration > 0 {
+                    self.apiDuration = TimeInterval(duration)
+                    print("✅ [PlayerViewModel] 오디오 duration 조회 성공: \(String(format: "%.1f", duration))초")
+                    
+                    // duration이 로드되면 진행률 업데이트 (UI에 반영)
+                    DispatchQueue.main.async {
+                        self.updateProgress()
+                    }
+                } else {
+                    print("⚠️ [PlayerViewModel] duration이 없거나 0입니다")
+                }
+            case .failure(let error):
+                print("❌ [PlayerViewModel] 오디오 duration 조회 실패: \(error.localizedDescription)")
+            }
+        }
+    }
+    
     private func simulateDataLoading() {
         // 로딩 시작 알림
         isLoading = true
@@ -196,21 +328,117 @@ final class PlayerViewModel {
     }
 
     private func prepareAudio() {
-        // 실제 오디오 파일을 찾아보고, 없으면 시뮬레이션 모드로 설정
-        guard let url = Bundle.main.url(forResource: "dummy", withExtension: "mp3") else {
-            print("⚠️ 오디오 파일을 찾을 수 없어 시뮬레이션 모드로 실행합니다.")
-            isUsingSimulation = true
-            return
-        }
+        // 우선 Docent의 오디오 URL이 있으면 그걸 사용
+        if let audioURL = docent.audioURL {
+            // URL이 원격 URL(HTTP/HTTPS)인지 확인
+            let isRemoteURL = audioURL.scheme == "http" || audioURL.scheme == "https"
 
-        do {
-            audioPlayer = try AVAudioPlayer(contentsOf: url)
-            audioPlayer?.prepareToPlay()
-            print("✅ 오디오 파일 로딩 성공")
-        } catch {
-            print("⚠️ 오디오 플레이어 초기화 실패, 시뮬레이션 모드로 전환: \(error.localizedDescription)")
-            isUsingSimulation = true
+            if isRemoteURL {
+                // 원격 URL인 경우 AVPlayer 사용
+                let playerItem = AVPlayerItem(url: audioURL)
+                avPlayer = AVPlayer(playerItem: playerItem)
+
+                // 볼륨 설정 (1.0 = 최대)
+                avPlayer?.volume = 1.0
+
+                // 자동 재생 대기 비활성화 (즉시 재생 가능하도록)
+                if #available(iOS 10.0, *) {
+                    avPlayer?.automaticallyWaitsToMinimizeStalling = false
+                }
+
+                isUsingSimulation = false
+                print("✅ 원격 오디오 URL 로딩 성공 (AVPlayer): \(audioURL.absoluteString)")
+
+                // 재생 상태 관찰
+                setupAVPlayerObservers(playerItem: playerItem)
+                return
+            } else {
+                // 로컬 파일 URL인 경우 AVAudioPlayer 사용
+                do {
+                    audioPlayer = try AVAudioPlayer(contentsOf: audioURL)
+                    audioPlayer?.volume = 1.0
+                    audioPlayer?.prepareToPlay()
+                    isUsingSimulation = false
+                    print("✅ 로컬 오디오 파일 로딩 성공 (AVAudioPlayer): \(audioURL.path)")
+                    return
+                } catch {
+                    print("⚠️ 로컬 오디오 초기화 실패: \(error.localizedDescription) -> 애니메이션 시뮬레이션으로 전환")
+                    audioPlayer = nil
+                    isUsingSimulation = true
+                    return
+                }
+            }
         }
+        // 없으면 더미로 시뮬레이션
+        if let url = Bundle.main.url(forResource: "dummy", withExtension: "mp3") {
+            do {
+                audioPlayer = try AVAudioPlayer(contentsOf: url)
+                audioPlayer?.volume = 1.0
+                audioPlayer?.prepareToPlay()
+                isUsingSimulation = false
+                print("✅ 더미 오디오 로딩 성공")
+                return
+            } catch { }
+        }
+        print("⚠️ 오디오 파일을 찾을 수 없어 시뮬레이션 모드로 실행합니다.")
+        isUsingSimulation = true
+    }
+    
+    private func setupAVPlayerObservers(playerItem: AVPlayerItem) {
+        guard let player = avPlayer else { return }
+        
+        // AVPlayerItem 상태 관찰 (준비 완료 확인)
+        playerItem.addObserver(self, forKeyPath: "status", options: [.new], context: nil)
+        
+        // 재생 시간 관찰 (0.1초 간격)
+        let interval = CMTime(seconds: 0.1, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] _ in
+            self?.updateHighlightIndex()
+            self?.updateProgress()
+        }
+        
+        // 재생 완료 알림
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(playerDidFinishPlaying),
+            name: .AVPlayerItemDidPlayToEndTime,
+            object: playerItem
+        )
+    }
+    
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+        if keyPath == "status" {
+            if let playerItem = object as? AVPlayerItem {
+                switch playerItem.status {
+                case .readyToPlay:
+                    print("✅ AVPlayerItem 준비 완료 - 재생 가능")
+                    // duration이 로드되었는지 확인하고 진행률 업데이트
+                    let duration = playerItem.duration
+                    let seconds = CMTimeGetSeconds(duration)
+                    if seconds.isFinite && seconds > 0 {
+                        print("📊 [PlayerViewModel] AVPlayer duration 로드됨: \(String(format: "%.1f", seconds))초")
+                        // duration이 로드되면 진행률 업데이트 (UI에 반영)
+                        DispatchQueue.main.async { [weak self] in
+                            self?.updateProgress()
+                        }
+                    }
+                case .failed:
+                    print("❌ AVPlayerItem 로딩 실패: \(playerItem.error?.localizedDescription ?? "알 수 없는 오류")")
+                    isUsingSimulation = true
+                case .unknown:
+                    print("⚠️ AVPlayerItem 상태 알 수 없음")
+                @unknown default:
+                    break
+                }
+            }
+        }
+    }
+    
+    @objc private func playerDidFinishPlaying() {
+        isPlaying = false
+        onPlayStateChanged?(false)
+        timer?.invalidate()
+        timer = nil
     }
 
     func togglePlayPause() {
@@ -223,6 +451,10 @@ final class PlayerViewModel {
         if isPlaying {
             pausePlayback()
         } else {
+            // 오디오 로딩이 안된 경우 재시도
+            if audioPlayer == nil && !isUsingSimulation {
+                prepareAudio()
+            }
             startPlayback()
         }
         
@@ -260,10 +492,62 @@ final class PlayerViewModel {
         }
     }
     
+    /// 프로그레스 바 터치 시 특정 시간으로 이동
+    /// - Parameter progress: 진행률 (0.0 ~ 1.0)
+    func seek(to progress: Float) {
+        // 로딩 중에는 seek 불가
+        guard !isLoading else {
+            print("⚠️ 아직 로딩 중입니다.")
+            return
+        }
+        
+        let totalTime = getTotalTime()
+        let targetTime = TimeInterval(progress) * totalTime
+        
+        print("⏩ [PlayerViewModel] Seek 요청: \(String(format: "%.1f", targetTime))초 (진행률: \(progress * 100)%)")
+        
+        if isUsingSimulation {
+            // 시뮬레이션 모드: 현재 시간 업데이트
+            simulationCurrentTime = targetTime
+            if isPlaying {
+                // 재생 중이면 시작 시간을 현재 시간 기준으로 재설정
+                simulationStartTime = Date()
+            } else {
+                simulationStartTime = nil
+            }
+            // 하이라이트 인덱스 업데이트
+            updateHighlightIndex()
+            // 진행률 업데이트
+            updateProgress()
+        } else if let avPlayer = avPlayer {
+            // AVPlayer 사용 (원격 URL)
+            let targetCMTime = CMTime(seconds: targetTime, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
+            avPlayer.seek(to: targetCMTime) { [weak self] completed in
+                if completed {
+                    print("✅ [PlayerViewModel] AVPlayer seek 완료: \(String(format: "%.1f", targetTime))초")
+                    // seek 후 하이라이트 인덱스 업데이트
+                    self?.updateHighlightIndex()
+                    self?.updateProgress()
+                } else {
+                    print("⚠️ [PlayerViewModel] AVPlayer seek 취소됨")
+                }
+            }
+        } else {
+            // AVAudioPlayer 사용 (로컬 파일)
+            audioPlayer?.currentTime = targetTime
+            print("✅ [PlayerViewModel] AVAudioPlayer seek 완료: \(String(format: "%.1f", targetTime))초")
+            // seek 후 하이라이트 인덱스 업데이트
+            updateHighlightIndex()
+            updateProgress()
+        }
+    }
+    
     private func resetPlaybackPosition() {
         if isUsingSimulation {
             simulationCurrentTime = 0.0
             simulationStartTime = nil
+        } else if let avPlayer = avPlayer {
+            avPlayer.seek(to: .zero)
         } else {
             audioPlayer?.currentTime = 0.0
         }
@@ -277,13 +561,26 @@ final class PlayerViewModel {
         if isUsingSimulation {
             // 시뮬레이션 모드: 현재 시간 기록
             simulationStartTime = Date()
+            startTimer()
+        } else if let avPlayer = avPlayer {
+            // AVPlayer 사용 (원격 URL)
+            // AVPlayerItem이 준비되었는지 확인
+            if let playerItem = avPlayer.currentItem, playerItem.status == .readyToPlay {
+                avPlayer.play()
+                print("▶️ AVPlayer 재생 시작")
+            } else {
+                print("⚠️ AVPlayerItem이 아직 준비되지 않음. 상태: \(avPlayer.currentItem?.status.rawValue ?? -1)")
+                // 준비되지 않았어도 재생 시도 (비동기 로딩 중일 수 있음)
+                avPlayer.play()
+            }
+            // AVPlayer는 timeObserver로 시간 업데이트하므로 별도 타이머 불필요
         } else {
-            // 실제 오디오 모드
+            // AVAudioPlayer 사용 (로컬 파일)
             audioPlayer?.play()
+            startTimer()
         }
         
-        startTimer()
-        print("▶️ 재생 시작 (시뮬레이션: \(isUsingSimulation))")
+        print("▶️ 재생 시작 (시뮬레이션: \(isUsingSimulation), AVPlayer: \(avPlayer != nil))")
     }
     
     private func pausePlayback() {
@@ -293,18 +590,19 @@ final class PlayerViewModel {
                 simulationCurrentTime += Date().timeIntervalSince(startTime)
             }
             simulationStartTime = nil
+            timer?.invalidate()
+            timer = nil
+        } else if let avPlayer = avPlayer {
+            // AVPlayer 사용 (원격 URL)
+            avPlayer.pause()
         } else {
-            // 실제 오디오 모드
+            // AVAudioPlayer 사용 (로컬 파일)
             audioPlayer?.pause()
+            timer?.invalidate()
+            timer = nil
         }
         
-        timer?.invalidate()
-        timer = nil
         print("⏸️ 재생 일시정지")
-    }
-
-    func currentPlayButtonTitle() -> String {
-        return isPlaying ? "⏸️ 정지" : "▶️ 재생"
     }
 
     private func startTimer() {
@@ -357,20 +655,55 @@ final class PlayerViewModel {
                 return simulationCurrentTime
             }
             return simulationCurrentTime + Date().timeIntervalSince(startTime)
+        } else if let avPlayer = avPlayer {
+            // AVPlayer 사용 (원격 URL)
+            return CMTimeGetSeconds(avPlayer.currentTime())
         } else {
-            // 실제 오디오 모드
+            // AVAudioPlayer 사용 (로컬 파일)
             return audioPlayer?.currentTime ?? 0.0
         }
     }
     
     private func getTotalTime() -> TimeInterval {
+        // 우선 문단 기반으로 총 시간 계산 (실제 도슨트 길이)
+        let paragraphBasedTime: TimeInterval = {
+            guard let lastParagraph = paragraphs.last else { return 0.0 }
+            return lastParagraph.endTime + 2.0 // 마지막 문단 끝 시간 + 여유 시간
+        }()
+        
+        // 1순위: API에서 가져온 duration (가장 정확)
+        if let apiDuration = apiDuration, apiDuration > 0 {
+            print("📊 [PlayerViewModel] API duration 사용: \(String(format: "%.1f", apiDuration))초")
+            return apiDuration
+        }
+        
         if isUsingSimulation {
-            // 시뮬레이션 모드: 마지막 문단 끝 시간 + 2초
-            guard let lastParagraph = paragraphs.last else { return 60.0 }
-            return lastParagraph.endTime + 2.0
+            // 시뮬레이션 모드: 문단 기반 시간 사용
+            return paragraphBasedTime > 0 ? paragraphBasedTime : 60.0
+        } else if let avPlayer = avPlayer, let duration = avPlayer.currentItem?.duration {
+            // AVPlayer 사용 (원격 URL)
+            let seconds = CMTimeGetSeconds(duration)
+            // duration이 유효하고 finite한 경우에만 사용
+            if seconds.isFinite && seconds > 0 {
+                // 실제 duration과 문단 기반 시간 중 더 큰 값 사용 (더 정확한 값)
+                return max(seconds, paragraphBasedTime)
+            } else {
+                // duration이 유효하지 않으면 문단 기반 시간 사용
+                return paragraphBasedTime > 0 ? paragraphBasedTime : 60.0
+            }
+        } else if let audioPlayer = audioPlayer {
+            // AVAudioPlayer 사용 (로컬 파일)
+            let duration = audioPlayer.duration
+            if duration > 0 {
+                // 실제 duration과 문단 기반 시간 중 더 큰 값 사용
+                return max(duration, paragraphBasedTime)
+            } else {
+                // duration이 0이면 문단 기반 시간 사용
+                return paragraphBasedTime > 0 ? paragraphBasedTime : 60.0
+            }
         } else {
-            // 실제 오디오 모드
-            return audioPlayer?.duration ?? 60.0
+            // 오디오 플레이어가 없으면 문단 기반 시간 사용
+            return paragraphBasedTime > 0 ? paragraphBasedTime : 60.0
         }
     }
 
@@ -383,6 +716,17 @@ final class PlayerViewModel {
     deinit {
         timer?.invalidate()
         audioPlayer?.stop()
+        
+        // AVPlayer 정리
+        if let timeObserver = timeObserver {
+            avPlayer?.removeTimeObserver(timeObserver)
+        }
+        // AVPlayerItem observer 제거
+        avPlayer?.currentItem?.removeObserver(self, forKeyPath: "status")
+        NotificationCenter.default.removeObserver(self)
+        avPlayer?.pause()
+        avPlayer = nil
+        
         print("🗑️ PlayerViewModel 해제됨")
     }
 }

@@ -1,11 +1,29 @@
+//
+//  UnderlineViewController.swift
+//  Artner
+//
+//  Feature Isolation Refactoring - UnderlineCoordinating 프로토콜 사용
+//
+
 import UIKit
 import Combine
 
 final class UnderlineViewController: UIViewController {
     private let underlineView = UnderlineView()
-    private let viewModel = UnderlineViewModel()
+    private let viewModel: UnderlineViewModel
     private var cancellables = Set<AnyCancellable>()
+    private weak var coordinator: (any UnderlineCoordinating)?
+
+    /// 기존 호환성을 위한 핸들러 (deprecated - coordinator 사용 권장)
     var goToFeedHandler: (() -> Void)?
+
+    init(viewModel: UnderlineViewModel, coordinator: (any UnderlineCoordinating)? = nil) {
+        self.viewModel = viewModel
+        self.coordinator = coordinator
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func loadView() { self.view = underlineView }
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -48,12 +66,21 @@ final class UnderlineViewController: UIViewController {
                 self?.updateButtonStates(selectedCategory: category)
             }
             .store(in: &cancellables)
+        
+        // 정렬 상태 변경 시 정렬 버튼 업데이트
+        viewModel.$sortDescending
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isDescending in
+                self?.updateSortButton(isDescending: isDescending)
+            }
+            .store(in: &cancellables)
     }
     private func setupActions() {
         underlineView.allButton.addTarget(self, action: #selector(didTapAll), for: .touchUpInside)
         underlineView.exhibitionButton.addTarget(self, action: #selector(didTapExhibition), for: .touchUpInside)
         underlineView.artistButton.addTarget(self, action: #selector(didTapArtist), for: .touchUpInside)
         underlineView.artworkButton.addTarget(self, action: #selector(didTapArtwork), for: .touchUpInside)
+        underlineView.sortButton.addTarget(self, action: #selector(didTapSort), for: .touchUpInside)
         underlineView.emptyView.goFeedButton.addTarget(self, action: #selector(didTapGoFeed), for: .touchUpInside)
     }
     // MARK: - Button State Management
@@ -80,19 +107,47 @@ final class UnderlineViewController: UIViewController {
         }
         
         // 선택된 버튼 스타일 적용
-        selectedButton.backgroundColor = UIColor.white.withAlphaComponent(0.2)
-        selectedButton.setTitleColor(.white, for: .normal)
+        selectedButton.backgroundColor = UIColor.white.withAlphaComponent(0.8) // #FFFFFF 80% 투명도
+        selectedButton.setTitleColor(UIColor(hex: "#292929"), for: .normal) // #292929 글자색
         selectedButton.layer.borderColor = UIColor.white.cgColor
     }
     
-    @objc private func didTapBack() { navigationController?.popViewController(animated: true) }
+    /// 정렬 버튼 상태 업데이트
+    /// - Parameter isDescending: 내림차순 여부 (true: 최신순, false: 오래된순)
+    private func updateSortButton(isDescending: Bool) {
+        if isDescending {
+            // 최신순 (내림차순)
+            underlineView.sortButton.setTitle("최신순", for: .normal)
+            // 위쪽 화살표 아이콘 찾아서 업데이트
+            if let chevronImageView = underlineView.sortButton.subviews.first(where: { $0 is UIImageView }) as? UIImageView {
+                chevronImageView.image = UIImage(systemName: "chevron.up")
+            }
+        } else {
+            // 오래된순 (오름차순)
+            underlineView.sortButton.setTitle("오래된순", for: .normal)
+            // 아래쪽 화살표 아이콘 찾아서 업데이트
+            if let chevronImageView = underlineView.sortButton.subviews.first(where: { $0 is UIImageView }) as? UIImageView {
+                chevronImageView.image = UIImage(systemName: "chevron.down")
+            }
+        }
+    }
+    
+    @objc private func didTapBack() {
+        coordinator?.popViewController(animated: true) ?? navigationController?.popViewController(animated: true)
+    }
     @objc private func didTapSearch() {}
-    @objc private func didTapAll() { viewModel.selectCategory(nil) }
-    @objc private func didTapExhibition() { viewModel.selectCategory(.exhibition) }
-    @objc private func didTapArtist() { viewModel.selectCategory(.artist) }
-    @objc private func didTapArtwork() { viewModel.selectCategory(.artwork) }
+    @objc private func didTapAll() { viewModel.selectCategory(nil); viewModel.fetchHighlights(filter: "all") }
+    @objc private func didTapExhibition() { viewModel.selectCategory(.exhibition); viewModel.fetchHighlights(filter: "artwork", itemType: "artwork") }
+    @objc private func didTapArtist() { viewModel.selectCategory(.artist); viewModel.fetchHighlights(filter: "artist", itemType: "artist") }
+    @objc private func didTapArtwork() { viewModel.selectCategory(.artwork); viewModel.fetchHighlights(filter: "artwork", itemType: "artwork") }
     @objc private func didTapSort() { viewModel.toggleSort() }
-    @objc private func didTapGoFeed() { goToFeedHandler?() }
+    @objc private func didTapGoFeed() {
+        if let coordinator = coordinator {
+            coordinator.popToHome()
+        } else {
+            goToFeedHandler?()
+        }
+    }
 }
 extension UnderlineViewController: UITableViewDataSource, UITableViewDelegate {
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {

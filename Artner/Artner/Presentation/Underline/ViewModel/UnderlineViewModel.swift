@@ -12,6 +12,7 @@ struct UnderlineItem {
     let subtitle: String?
     let imageUrl: String?
     let isDocentAvailable: Bool
+    let highlightCount: Int // 해당 항목의 하이라이트 개수
     let createdAt: Date // 추가된 날짜 (최근 순 정렬용)
 }
 
@@ -23,16 +24,12 @@ final class UnderlineViewModel {
 
     private var allItems: [UnderlineItem] = []
     private var cancellables = Set<AnyCancellable>()
+    private let getHighlightsUseCase: GetHighlightsUseCase
 
-    init() {
-        // 더미 데이터 세팅 (최근 추가된 순서로 정렬)
-        let now = Date()
-        allItems = [
-            UnderlineItem(id: "2", type: .exhibition, title: "밑줄 전시회", subtitle: "국립현대미술관", imageUrl: nil, isDocentAvailable: false, createdAt: now.addingTimeInterval(-3600)), // 1시간 전
-            UnderlineItem(id: "1", type: .artwork, title: "밑줄 친 명화", subtitle: "작가 미상", imageUrl: nil, isDocentAvailable: false, createdAt: now.addingTimeInterval(-7200)) // 2시간 전
-        ]
+    init(getHighlightsUseCase: GetHighlightsUseCase) {
+        self.getHighlightsUseCase = getHighlightsUseCase
         bind()
-        filterAndSort()
+        fetchHighlights()
     }
     private func bind() {
         $selectedCategory
@@ -61,8 +58,48 @@ final class UnderlineViewModel {
     }
     func selectCategory(_ type: UnderlineItemType?) {
         selectedCategory = type
+        // 서버 정렬/필터 반영을 위해 다시 불러올 수도 있음. 현재는 클라이언트 필터 후 필요 시 재요청.
     }
     func toggleSort() {
         sortDescending.toggle()
+    }
+    
+    // MARK: - Networking
+    func fetchHighlights(filter: String? = nil, itemName: String? = nil, itemType: String? = nil, ordering: String? = "latest", page: Int? = 1, search: String? = nil) {
+        getHighlightsUseCase
+            .execute(filter: filter, itemName: itemName, itemType: itemType, ordering: ordering, page: page, search: search)
+            .receive(on: DispatchQueue.main)
+            .sink(receiveCompletion: { completion in
+                if case .failure = completion { self.items = []; self.isEmpty = true }
+            }, receiveValue: { [weak self] response in
+                guard let self = self else { return }
+                // Map DTO -> UI Model
+                let dateFormatter = ISO8601DateFormatter()
+                dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let mapped: [UnderlineItem] = response.results.map { dto in
+                    let type: UnderlineItemType
+                    switch dto.itemType {
+                    case "artist": type = .artist
+                    case "artwork": type = .artwork
+                    default: type = .exhibition
+                    }
+                    let created = dto.latestDate.flatMap { dateFormatter.date(from: $0) } ?? Date()
+                    // id가 없으므로 itemType + itemName으로 고유 식별자 생성
+                    let uniqueId = "\(dto.itemType)_\(dto.itemName)"
+                    return UnderlineItem(
+                        id: uniqueId,
+                        type: type,
+                        title: dto.itemName,
+                        subtitle: dto.subtitle,
+                        imageUrl: dto.thumbnailUrl,
+                        isDocentAvailable: false,
+                        highlightCount: dto.highlightCount,
+                        createdAt: created
+                    )
+                }
+                self.allItems = mapped
+                self.filterAndSort()
+            })
+            .store(in: &cancellables)
     }
 } 

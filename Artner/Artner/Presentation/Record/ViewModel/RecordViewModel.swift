@@ -1,68 +1,128 @@
 import Foundation
 import Combine
+import UIKit
 
-enum RecordItemType {
-    case exhibition, artist, artwork
-}
-
-struct RecordItem {
-    let id: String
-    let type: RecordItemType
-    let title: String
-    let subtitle: String?
-    let imageUrl: String?
-    let isDocentAvailable: Bool
-    let createdAt: Date // 추가된 날짜 (최근 순 정렬용)
-}
-
-final class RecordViewModel {
-    @Published var items: [RecordItem] = []
-    @Published var selectedCategory: RecordItemType? = nil
-    @Published var isEmpty: Bool = false
+final class RecordViewModel: ObservableObject {
+    
+    @Published var allItems: [RecordItemModel] = []
+    @Published var filteredItems: [RecordItemModel] = []
     @Published var sortDescending: Bool = true
-
-    private var allItems: [RecordItem] = []
+    @Published var isLoading: Bool = true
+    
     private var cancellables = Set<AnyCancellable>()
-
-    init() {
-        // 더미 데이터 세팅 (최근 추가된 순서로 정렬)
-        let now = Date()
-        allItems = [
-            RecordItem(id: "2", type: .artwork, title: "관람한 작품", subtitle: "작가 미상", imageUrl: nil, isDocentAvailable: false, createdAt: now.addingTimeInterval(-3600)), // 1시간 전
-            RecordItem(id: "1", type: .exhibition, title: "2024 아트페어 방문기록", subtitle: "코엑스 A홀", imageUrl: nil, isDocentAvailable: false, createdAt: now.addingTimeInterval(-7200)) // 2시간 전
-        ]
+    
+    // MARK: - UseCase Dependencies
+    private let getRecordsUseCase: GetRecordsUseCase
+    private let deleteRecordUseCase: DeleteRecordUseCase
+    
+    init(getRecordsUseCase: GetRecordsUseCase, deleteRecordUseCase: DeleteRecordUseCase) {
+        self.getRecordsUseCase = getRecordsUseCase
+        self.deleteRecordUseCase = deleteRecordUseCase
         bind()
-        filterAndSort()
+        loadRecords()
+        setupNotificationObservers()
     }
+    
     private func bind() {
-        $selectedCategory
-            .sink { [weak self] _ in self?.filterAndSort() }
-            .store(in: &cancellables)
+        // 정렬 변경 감지
         $sortDescending
-            .sink { [weak self] _ in self?.filterAndSort() }
+            .sink { [weak self] _ in
+                self?.filterAndSort()
+            }
             .store(in: &cancellables)
     }
-    func filterAndSort() {
-        var filtered = allItems
-        if let category = selectedCategory {
-            filtered = filtered.filter { $0.type == category }
-        }
+    
+    // MARK: - API Methods
+    
+    /// 전시기록 목록 로드
+    private func loadRecords() {
+        isLoading = true
         
-        // 최근 추가된 순서로 정렬 (createdAt 기준 내림차순)
-        filtered = filtered.sorted { $0.createdAt > $1.createdAt }
-        
-        // 사용자가 정렬 순서를 변경한 경우에만 반전
-        if !sortDescending {
-            filtered = filtered.reversed()
-        }
-        
-        items = filtered
-        isEmpty = items.isEmpty
+        getRecordsUseCase.execute()
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    self?.isLoading = false
+                    if case .failure(let error) = completion {
+                        print("❌ [RecordViewModel] 전시기록 목록 로드 실패: \(error)")
+                        // Toast 에러 메시지 표시 (배경: #222222, 아이콘: #FC5959)
+                        ToastManager.shared.showError("전시기록을 불러오는데 실패했습니다.")
+                    }
+                },
+                receiveValue: { [weak self] recordList in
+                    print("📝 [RecordViewModel] 전시기록 목록 로드 완료: \(recordList.results.count)개")
+                    self?.allItems = recordList.results.map { $0.toRecordItemModel() }
+                    self?.filterAndSort()
+                }
+            )
+            .store(in: &cancellables)
     }
-    func selectCategory(_ type: RecordItemType?) {
-        selectedCategory = type
+    
+    /// NotificationCenter 옵저버 설정
+    private func setupNotificationObservers() {
+        NotificationCenter.default.publisher(for: .recordDidCreate)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                print("📝 [RecordViewModel] 새 전시기록 생성 알림 수신 - 목록 새로고침")
+                self?.loadRecords()
+            }
+            .store(in: &cancellables)
     }
+    
+    private func filterAndSort() {
+        filteredItems = allItems.sorted { item1, item2 in
+            if sortDescending {
+                return item1.createdAt > item2.createdAt
+            } else {
+                return item1.createdAt < item2.createdAt
+            }
+        }
+    }
+    
     func toggleSort() {
         sortDescending.toggle()
     }
-} 
+    
+    /// 새로운 전시 기록 추가
+    func addRecordItem(_ item: RecordItemModel) {
+        allItems.append(item)
+        filterAndSort()
+        print("📝 [RecordViewModel] 새로운 전시 기록 추가됨: \(item.exhibitionName)")
+    }
+    
+    /// 전시 기록 삭제
+    func deleteRecordItem(with id: String) {
+        guard let recordId = Int(id) else {
+            print("❌ [RecordViewModel] 잘못된 ID 형식: \(id)")
+            return
+        }
+        
+        let deletedItemName = allItems.first { $0.id == id }?.exhibitionName ?? "전시기록"
+        
+        deleteRecordUseCase.execute(id: recordId)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    if case .failure(let error) = completion {
+                        print("❌ [RecordViewModel] 전시기록 삭제 실패: \(error)")
+                        // Toast 에러 메시지 표시 (배경: #222222, 아이콘: #FC5959)
+                        ToastManager.shared.showError("전시기록 삭제에 실패했습니다.")
+                    }
+                },
+                receiveValue: { [weak self] _ in
+                    print("📝 [RecordViewModel] 전시기록 삭제 성공: \(id)")
+                    // UI에서 제거
+                    self?.allItems.removeAll { $0.id == id }
+                    self?.filterAndSort()
+                    // Toast 삭제 메시지 표시 (배경: #222222, 아이콘: #FC5959)
+                    ToastManager.shared.showDelete("'\(deletedItemName)' 전시기록이 삭제되었습니다.")
+                }
+            )
+            .store(in: &cancellables)
+    }
+    
+    /// 빈 상태 확인
+    var isEmpty: Bool {
+        return filteredItems.isEmpty
+    }
+}

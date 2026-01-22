@@ -12,7 +12,8 @@ final class PlayerView: BaseView {
 
     // MARK: - UI Components
 
-    // 제목 영역 (SafeArea 위부터 시작)
+    // 상단 네비게이션 바 + 제목 영역
+    let navigationBar = CustomNavigationBar()
     let artnerPrimaryBar = ArtnerPrimaryBar()
     
     // 상단 radial 그라데이션 (SafeArea부터 ArtnerPrimaryBar + 42px까지)
@@ -53,6 +54,9 @@ final class PlayerView: BaseView {
     // ViewModel에서 하이라이트를 가져오기 위한 콜백
     var onGetHighlightsForParagraph: ((String) -> [TextHighlight])?
     
+    // 프로그레스 바 터치 콜백 (진행률 0.0 ~ 1.0)
+    var onProgressTapped: ((Float) -> Void)?
+    
     // 로딩 상태
     private var isLoading = true {
         didSet {
@@ -66,6 +70,10 @@ final class PlayerView: BaseView {
             updateTextSelectionEnabled(!isPlaying)
         }
     }
+    
+    // 네비게이션 바 상단 슬라이드 관련
+    private let navHideHeight: CGFloat = 56
+    private var navigationBarTopConstraint: Constraint?
 
     // MARK: - Setup
 
@@ -85,6 +93,7 @@ final class PlayerView: BaseView {
     
     private func setupHierarchy() {
         // 기본 컨텐츠들을 추가
+        addSubview(navigationBar)
         addSubview(artnerPrimaryBar)
         addSubview(fadeoutGradientView)
         addSubview(lyricsContainerView)
@@ -102,6 +111,15 @@ final class PlayerView: BaseView {
         
         timeStackView.addArrangedSubview(currentTimeLabel)
         timeStackView.addArrangedSubview(totalTimeLabel)
+        
+        // 네비게이션 바 설정
+        navigationBar.backgroundColor = AppColor.background
+        navigationBar.setTitle("artner")
+        navigationBar.titleLabel.font = UIFont.poppinsMedium(size: 16)
+        navigationBar.titleLabel.textColor = UIColor(hex: "#D0AE86")
+        navigationBar.backButton.tintColor = AppColor.textPrimary
+        navigationBar.rightButton.tintColor = AppColor.textPrimary
+        navigationBar.onBackButtonTapped = { [weak self] in self?.didTapBack() }
     }
     
     private func setupTableView() {
@@ -122,23 +140,32 @@ final class PlayerView: BaseView {
     }
     
     private func setupControlsArea() {
+        // 컨트롤 영역이 터치를 제대로 전달하도록 설정
+        controlsContainerView.clipsToBounds = false
+        controlsContainerView.isUserInteractionEnabled = true
+
         // 시간 표시 스택뷰 설정
         timeStackView.axis = .horizontal
         timeStackView.distribution = .equalSpacing
         timeStackView.alignment = .center
         timeStackView.spacing = 0
-        
+
         // 시간 라벨 설정
         currentTimeLabel.textColor = AppColor.textSecondary
         currentTimeLabel.font = UIFont.systemFont(ofSize: 14, weight: .medium)
         currentTimeLabel.text = "0:00"
-        
+
         totalTimeLabel.textColor = AppColor.textSecondary
         totalTimeLabel.font = UIFont.systemFont(ofSize: 14, weight: .medium)
         totalTimeLabel.text = "0:00"
-        
+
         // 플레이어 컨트롤 초기 비활성화
         playerControls.setEnabled(false)
+
+        // 프로그레스 바 터치 이벤트 설정
+        progressView.onProgressTapped = { [weak self] progress in
+            self?.onProgressTapped?(progress)
+        }
     }
     
     private func setupGradientViews() {
@@ -184,14 +211,21 @@ final class PlayerView: BaseView {
     override func setupLayout() {
         super.setupLayout()
         
-        // 제목 바 (SafeArea 내에서 시작, 여백 추가)
-        artnerPrimaryBar.snp.makeConstraints {
-            $0.top.equalTo(safeAreaLayoutGuide.snp.top).offset(10)
-            $0.leading.trailing.equalToSuperview()
-            $0.height.equalTo(60)  // 42 → 60으로 증가
+        // 상단 네비게이션 바 (SafeArea 최상단)
+        navigationBar.snp.makeConstraints {
+            self.navigationBarTopConstraint = $0.top.equalTo(safeAreaLayoutGuide).constraint
+            $0.leading.trailing.equalTo(safeAreaLayoutGuide)
+            $0.height.equalTo(56)
         }
         
-        // 페이드아웃 그라데이션 (상태바 포함 화면 맨 위부터 제목바까지)
+        // 제목 바 (네비게이션 바 아래로 분리 배치)
+        artnerPrimaryBar.snp.makeConstraints {
+            $0.top.equalTo(navigationBar.snp.bottom)
+            $0.leading.trailing.equalToSuperview()
+            $0.height.equalTo(60)
+        }
+        
+        // 페이드아웃 그라데이션 (상단에서 제목바까지)
         fadeoutGradientView.snp.makeConstraints {
             $0.top.equalToSuperview()
             $0.leading.trailing.equalToSuperview()
@@ -234,13 +268,16 @@ final class PlayerView: BaseView {
             $0.height.equalTo(40)
         }
         
-        // 플레이어 컨트롤 (위쪽에 배치, 56px 높이)
+        // 플레이어 컨트롤 (위쪽에 배치)
+        // PlayerControlsView가 intrinsicContentSize로 자체 크기 결정
+        // 3버튼 레이아웃: 216px, 2버튼 레이아웃: 150px
         playerControls.snp.makeConstraints {
             $0.top.equalToSuperview().offset(12)
             $0.centerX.equalToSuperview()
-            $0.width.equalTo(120)
-            $0.height.equalTo(56)
+            $0.height.equalTo(64) // 충분한 높이 확보
         }
+        playerControls.setContentHuggingPriority(.required, for: .horizontal)
+        playerControls.setContentCompressionResistancePriority(.required, for: .horizontal)
         
         // 진행 바 (컨트롤 아래에 배치)
         progressView.snp.makeConstraints {
@@ -278,7 +315,32 @@ final class PlayerView: BaseView {
     func setParagraphs(_ paragraphs: [DocentParagraph]) {
         self.paragraphs = paragraphs
         lyricsTableView.reloadData() // 테이블 뷰를 새로고침하여 문단 데이터를 반영
+        
+        // 실제 도슨트 길이 계산하여 총 시간 표시 업데이트
+        let totalDuration = calculateTotalDuration(from: paragraphs)
+        updateTotalTimeLabel(totalDuration)
     }
+    
+    /// 문단 배열에서 총 재생 시간 계산
+    private func calculateTotalDuration(from paragraphs: [DocentParagraph]) -> TimeInterval {
+        guard let lastParagraph = paragraphs.last else { return 0.0 }
+        // 마지막 문단의 endTime이 총 재생 시간
+        return lastParagraph.endTime
+    }
+    
+    /// 총 시간 라벨 업데이트
+    private func updateTotalTimeLabel(_ totalTime: TimeInterval) {
+        // formatTime 헬퍼 메서드 사용
+        totalTimeLabel.text = formatTime(totalTime)
+    }
+
+    // MARK: - Actions
+    @objc private func didTapBack() {
+        onBackButtonTapped?()
+    }
+
+    // MARK: - Callback
+    var onBackButtonTapped: (() -> Void)?
     
     /// 로딩 상태 표시
     func showLoadingState() {
@@ -310,6 +372,11 @@ final class PlayerView: BaseView {
         }
     }
     
+    /// 저장 상태 UI 반영 (저장 버튼 색상)
+    func setSaved(_ saved: Bool) {
+        playerControls.setSaved(saved)
+    }
+    
     /// 문단 하이라이트
     func highlightParagraph(at index: Int) {
         guard index >= 0 && index < paragraphs.count && !isLoading else { return }
@@ -328,20 +395,27 @@ final class PlayerView: BaseView {
     func updateProgress(_ currentTime: TimeInterval, totalTime: TimeInterval) {
         guard !isLoading else { return }
         
-        // 현재 시간 표시 업데이트
-        let currentMinutes = Int(currentTime) / 60
-        let currentSeconds = Int(currentTime) % 60
-        currentTimeLabel.text = String(format: "%d:%02d", currentMinutes, currentSeconds)
+        // 현재 시간 표시 업데이트 (초 단위를 분:초 형식으로 변환)
+        currentTimeLabel.text = formatTime(currentTime)
         
-        // 총 시간 표시 업데이트
-        let totalMinutes = Int(totalTime) / 60
-        let totalSeconds = Int(totalTime) % 60
-        totalTimeLabel.text = String(format: "%d:%02d", totalMinutes, totalSeconds)
+        // 총 시간 표시 업데이트 (초 단위를 분:초 형식으로 변환)
+        totalTimeLabel.text = formatTime(totalTime)
         
         // 진행 바 업데이트
         if totalTime > 0 {
             progressView.setProgress(Float(currentTime / totalTime), animated: true)
         }
+    }
+    
+    /// 시간을 "분:초" 형식으로 변환하는 헬퍼 메서드
+    /// - Parameter time: 초 단위 시간 (TimeInterval)
+    /// - Returns: "분:초" 형식의 문자열 (예: "2:33", "10:05")
+    private func formatTime(_ time: TimeInterval) -> String {
+        // TimeInterval은 초 단위이므로, 분과 초로 변환
+        let totalSeconds = Int(time)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
     }
     
     /// 플레이 상태 업데이트
@@ -411,67 +485,6 @@ final class PlayerView: BaseView {
         // 로딩 상태 변경에 따른 추가 UI 업데이트가 필요하면 여기에
     }
     
-    /// 저장 성공 토스트 메시지 표시
-    private func showSaveSuccessMessage() {
-        let messageLabel = UILabel()
-        messageLabel.text = "🖍️ 하이라이트가 저장되었습니다"
-        messageLabel.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        messageLabel.textColor = .white
-        messageLabel.textAlignment = .center
-        messageLabel.layer.cornerRadius = 20
-        messageLabel.clipsToBounds = true
-        messageLabel.alpha = 0
-        
-        addSubview(messageLabel)
-        messageLabel.snp.makeConstraints {
-            $0.centerX.equalToSuperview()
-            $0.bottom.equalTo(controlsContainerView.snp.top).offset(-20)
-            $0.height.equalTo(40)
-            $0.width.equalTo(250)
-        }
-        
-        // 페이드 인/아웃 애니메이션
-        UIView.animate(withDuration: 0.3, animations: {
-            messageLabel.alpha = 1.0
-        }) { _ in
-            UIView.animate(withDuration: 0.3, delay: 1.5, animations: {
-                messageLabel.alpha = 0
-            }) { _ in
-                messageLabel.removeFromSuperview()
-            }
-        }
-    }
-    
-    /// 삭제 성공 토스트 메시지 표시
-    private func showDeleteSuccessMessage() {
-        let messageLabel = UILabel()
-        messageLabel.text = "🗑️ 하이라이트가 삭제되었습니다"
-        messageLabel.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-        messageLabel.textColor = .white
-        messageLabel.textAlignment = .center
-        messageLabel.layer.cornerRadius = 20
-        messageLabel.clipsToBounds = true
-        messageLabel.alpha = 0
-        
-        addSubview(messageLabel)
-        messageLabel.snp.makeConstraints {
-            $0.centerX.equalToSuperview()
-            $0.bottom.equalTo(controlsContainerView.snp.top).offset(-20)
-            $0.height.equalTo(40)
-            $0.width.equalTo(250)
-        }
-        
-        // 페이드 인/아웃 애니메이션
-        UIView.animate(withDuration: 0.3, animations: {
-            messageLabel.alpha = 1.0
-        }) { _ in
-            UIView.animate(withDuration: 0.3, delay: 1.5, animations: {
-                messageLabel.alpha = 0
-            }) { _ in
-                messageLabel.removeFromSuperview()
-            }
-        }
-    }
     
     /// 플레이 상태에 따른 하단 페이드아웃 그라데이션 표시/숨김
     private func showFadeoutGradient(_ isPlaying: Bool) {
@@ -497,26 +510,22 @@ extension PlayerView: UITableViewDataSource {
         
         let paragraph = paragraphs[indexPath.row]
         let isHighlighted = indexPath.row == currentHighlightIndex
-        
-        // 하이라이트 가능 조건: 현재 재생 중인 문단 + 재생 중인 상태
-        let canHighlight = isHighlighted && isPlaying
-        
+
+        // 하이라이트 가능 조건: 정지 상태일 때만 모든 문단에서 텍스트 선택 가능
+        // iOS 네이티브 텍스트 선택 방식 사용 (길게 누르고 드래그)
+        let canHighlight = !isPlaying
+
         // 하이라이트 저장 콜백 설정 (ViewModel로 전달)
         cell.onHighlightSaved = { [weak self] highlight in
             self?.onHighlightCreated?(highlight)
-            self?.showSaveSuccessMessage()
         }
-        
+
         // 하이라이트 삭제 콜백 설정 (ViewModel로 전달)
         cell.onHighlightDeleted = { [weak self] highlight in
             self?.onHighlightDeleted?(highlight)
-            self?.showDeleteSuccessMessage()
         }
-        
-        // 텍스트 선택 상태 설정 
-        cell.setTextSelectionEnabled(!isPlaying)
-        
-        // configure에서 하이라이트 활성화 조건을 전달
+
+        // configure에서 하이라이트 활성화 조건을 전달 (정지 상태에서만 활성화)
         cell.configure(with: paragraph, isHighlighted: isHighlighted, canHighlight: canHighlight)
         
         // 저장된 하이라이트 로드 (ViewModel에서 가져와서 적용)
@@ -546,5 +555,17 @@ extension PlayerView: UITableViewDelegate {
         let estimatedHeight = CGFloat(estimatedLineCount) * 25 + 40  // 줄 높이 25px + 여백 40px
         
         return max(80, estimatedHeight)
+    }
+    
+        // 스크롤에 따른 최상단 네비게이션 바 상단으로 밀어 올리기
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        let offsetY = max(0, scrollView.contentOffset.y)
+        let hide = min(offsetY, navHideHeight)
+        navigationBarTopConstraint?.update(offset: -hide)
+        // 살짝 시각적 자연스러움 위해 alpha도 같이 처리(옵션)
+        let alpha = max(0, 1 - (hide / navHideHeight))
+        navigationBar.alpha = alpha
+        navigationBar.isUserInteractionEnabled = alpha > 0.05
+        layoutIfNeeded()
     }
 }

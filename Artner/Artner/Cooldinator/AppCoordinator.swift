@@ -3,32 +3,61 @@
 //  Artner
 //
 //  Created by 신종원 on 4/27/25.
+//  Feature Isolation Refactoring - 모든 Feature Coordinator 프로토콜 구현
 //
 
 import UIKit
+import Combine
 
-final class AppCoordinator {
+final class AppCoordinator:
+    Coordinator,
+    LaunchCoordinating,
+    HomeCoordinating,
+    EntryCoordinating,
+    PlayerCoordinating,
+    CameraCoordinating,
+    SaveCoordinating,
+    SidebarCoordinating,
+    LikeCoordinating,
+    RecordCoordinating,
+    UnderlineCoordinating,
+    SidebarViewControllerDelegate
+{
     private let window: UIWindow
     private let navigationController: UINavigationController
 
-    private let docentRepository = DocentRepositoryImpl()
-    private lazy var playDocentUseCase: PlayDocentUseCase = PlayDocentUseCaseImpl(repository: docentRepository)
-
-    private let feedRepository = FeedRepositoryImpl()
-    private lazy var fetchFeedUseCase: FetchFeedUseCase = FetchFeedUseCaseImpl(repository: feedRepository)
+    // DI Container 사용
+    private let container = DIContainer.shared
 
     private var sideMenu: SideMenuContainerView?
+    private var cancellables = Set<AnyCancellable>()
 
     init(window: UIWindow) {
         self.window = window
         self.navigationController = UINavigationController()
+
+        // 강제 로그아웃 노티피케이션 구독
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleForceLogout),
+            name: .forceLogout,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     func start() {
-        let homeViewModel = HomeViewModel(fetchFeedUseCase: fetchFeedUseCase)
+        // DI Container 설정
+        container.configureForDevelopment()
+
+        // DI Container를 통해 ViewModel 생성
+        let homeViewModel = container.makeHomeViewModel()
         let homeVC = HomeViewController(viewModel: homeViewModel, coordinator: self)
         homeVC.onCameraTapped = { [weak self] in
-            self?.presentCameraEntry()
+            self?.showCamera()
         }
         homeVC.onShowSidebar = { [weak self, weak homeVC] in
             guard let self = self, let homeVC = homeVC else { return }
@@ -39,11 +68,67 @@ final class AppCoordinator {
         window.makeKeyAndVisible()
     }
 
+    // MARK: - Coordinator Protocol
+
+    func popViewController(animated: Bool) {
+        navigationController.popViewController(animated: animated)
+    }
+
+    // MARK: - LaunchCoordinating
+
+    func showMainScreen() {
+        let homeViewModel = container.makeHomeViewModel()
+        let homeVC = HomeViewController(viewModel: homeViewModel, coordinator: self)
+        homeVC.onCameraTapped = { [weak self] in
+            self?.showCamera()
+        }
+        homeVC.onShowSidebar = { [weak self, weak homeVC] in
+            guard let self = self, let homeVC = homeVC else { return }
+            self.showSidebar(from: homeVC)
+        }
+        navigationController.setViewControllers([homeVC], animated: true)
+    }
+
+    // MARK: - HomeCoordinating
+
     func showEntry(docent: Docent) {
         let viewModel = EntryViewModel(docent: docent)
         let vc = EntryViewController(viewModel: viewModel, coordinator: self)
         navigationController.pushViewController(vc, animated: true)
     }
+
+    func showCamera() {
+        let cameraVC = CameraViewController(coordinator: self)
+        cameraVC.modalPresentationStyle = .fullScreen
+        navigationController.present(cameraVC, animated: true)
+    }
+
+    func showSidebar(from viewController: UIViewController) {
+        let sidebarViewModel = container.makeSidebarViewModel()
+        let sidebarVC = SidebarViewController(viewModel: sidebarViewModel, coordinator: self)
+        sidebarVC.delegate = self
+        let sideMenu = SideMenuContainerView(menuViewController: sidebarVC, parentViewController: viewController)
+        self.sideMenu = sideMenu
+        sideMenu.present(in: viewController)
+    }
+
+    func toggleLike(type: LikeType, id: Int, completion: @escaping (Result<Bool, any Error>) -> Void) {
+        container.toggleLikeUseCase.execute(type: type, id: id)
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { result in
+                    if case .failure(let error) = result {
+                        completion(.failure(error))
+                    }
+                },
+                receiveValue: { isLiked in
+                    completion(.success(isLiked))
+                }
+            )
+            .store(in: &cancellables)
+    }
+
+    // MARK: - EntryCoordinating
 
     func showChat(docent: Docent, keyword: String) {
         let viewModel = ChatViewModel(keyword: keyword, docent: docent)
@@ -52,19 +137,93 @@ final class AppCoordinator {
     }
 
     func showPlayer(docent: Docent) {
-        let playerViewModel = PlayerViewModel(docent: docent)
-        let playerVC = PlayerViewController(viewModel: playerViewModel, coordinator: self)
-        navigationController.pushViewController(playerVC, animated: true)
+        print("🎬 [AppCoordinator] showPlayer 호출됨")
+        print("🎬 [AppCoordinator] audioURL: \(docent.audioURL?.absoluteString ?? "nil")")
+        print("🎬 [AppCoordinator] audioJobId: \(docent.audioJobId ?? "nil")")
+
+        if docent.audioURL == nil, let audioJobId = docent.audioJobId {
+            print("🎬 [AppCoordinator] streamAudio 호출 필요 - jobId: \(audioJobId)")
+            ToastManager.shared.showLoading("오디오 불러오는 중")
+            APIService.shared.streamAudio(jobId: audioJobId)
+                .receive(on: DispatchQueue.main)
+                .sink(
+                    receiveCompletion: { completion in
+                        ToastManager.shared.hideCurrentToast()
+                        if case .failure(let error) = completion {
+                            print("❌ [AppCoordinator] streamAudio 실패: \(error)")
+                            ToastManager.shared.showError("오디오를 불러오는데 실패했습니다")
+                        }
+                    },
+                    receiveValue: { [weak self] fileURL in
+                        guard let self = self else { return }
+                        ToastManager.shared.hideCurrentToast()
+                        let docentWithAudio = Docent(
+                            id: docent.id,
+                            title: docent.title,
+                            artist: docent.artist,
+                            description: docent.description,
+                            imageURL: docent.imageURL,
+                            audioURL: fileURL,
+                            audioJobId: docent.audioJobId,
+                            paragraphs: docent.paragraphs
+                        )
+                        let playerViewModel = self.container.makePlayerViewModel(docent: docentWithAudio)
+                        let playerVC = PlayerViewController(viewModel: playerViewModel, coordinator: self)
+                        self.navigationController.pushViewController(playerVC, animated: true)
+                    }
+                )
+                .store(in: &cancellables)
+        } else {
+            let playerViewModel = container.makePlayerViewModel(docent: docent)
+            let playerVC = PlayerViewController(viewModel: playerViewModel, coordinator: self)
+            navigationController.pushViewController(playerVC, animated: true)
+        }
     }
 
-    func presentCameraEntry() {
-        // 카메라 인식 결과로 진입 시, 기존 더미 도슨트 데이터(문단 포함)를 활용
-        let docents = playDocentUseCase.fetchDocents()
-        if let first = docents.first, !first.paragraphs.isEmpty {
-            showEntry(docent: first)
-            return
+    // MARK: - PlayerCoordinating
+
+    func showSave(folderId: Int?) {
+        let saveVC = SaveViewController()
+        saveVC.goToFeedHandler = { [weak self] in self?.popToHome() }
+        navigationController.pushViewController(saveVC, animated: true)
+
+        if let folderId = folderId {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                saveVC.navigateToFolder(folderId: folderId)
+            }
         }
-        // 폴백: 최소 1개의 문단을 가진 샘플 생성
+    }
+
+    func getFolders() -> AnyPublisher<[Folder], any Error> {
+        return container.getFoldersUseCase.execute()
+            .mapError { $0 as any Error }
+            .eraseToAnyPublisher()
+    }
+
+    // MARK: - CameraCoordinating
+
+    func dismissCameraAndShowEntry(docent: Docent) {
+        if navigationController.presentedViewController != nil {
+            navigationController.dismiss(animated: true) { [weak self] in
+                self?.showEntry(docent: docent)
+            }
+        } else {
+            showEntry(docent: docent)
+        }
+    }
+
+    func dismissCameraAndShowPlayer(docent: Docent) {
+        if navigationController.presentedViewController != nil {
+            navigationController.dismiss(animated: true) { [weak self] in
+                self?.showPlayer(docent: docent)
+            }
+        } else {
+            showPlayer(docent: docent)
+        }
+    }
+
+    func navigateToEntryFromCamera(with capturedImage: UIImage?) {
+        let docents = container.playDocentUseCase.fetchDocents()
         let fallback = Docent(
             id: 999,
             title: "카메라로 스캔한 작품",
@@ -72,6 +231,7 @@ final class AppCoordinator {
             description: "이 작품은 이미지 인식을 통해 탐색된 결과입니다.",
             imageURL: "https://www.naver.com",
             audioURL: nil,
+            audioJobId: "f2ec47d2-bd1f-42e2-b70d-aeefc237f12e",
             paragraphs: [
                 DocentParagraph(
                     id: "p-999-1",
@@ -83,63 +243,175 @@ final class AppCoordinator {
                 )
             ]
         )
-        showEntry(docent: fallback)
+
+        let docent = docents.first ?? fallback
+
+        if navigationController.presentedViewController != nil {
+            navigationController.dismiss(animated: true) { [weak self] in
+                self?.showEntry(docent: docent)
+            }
+        } else {
+            showEntry(docent: docent)
+        }
     }
 
-    func showSidebar(from presentingVC: UIViewController) {
-        let sidebarVC = SidebarViewController()
-        sidebarVC.delegate = self // delegate 연결
-        let sideMenu = SideMenuContainerView(menuViewController: sidebarVC, parentViewController: presentingVC)
-        self.sideMenu = sideMenu
-        sideMenu.present(in: presentingVC)
+    // MARK: - SaveCoordinating (showEntry, popToHome already defined)
+
+    // MARK: - SidebarCoordinating
+
+    func closeSidebar() {
+        sideMenu?.dismissMenu()
     }
 
-    func popViewController(animated: Bool) {
-        navigationController.popViewController(animated: animated)
-    }
-
-    // MARK: - 좋아요/저장/밑줄/전시기록 화면 이동
     func showLike() {
-        let likeVC = LikeViewController()
-        likeVC.goToFeedHandler = { [weak self] in self?.popToHome() }
-        navigationController.pushViewController(likeVC, animated: true)
+        sideMenu?.dismissMenu(completion: { [weak self] in
+            guard let self = self else { return }
+            let likeViewModel = self.container.makeLikeViewModel()
+            let likeVC = LikeViewController(viewModel: likeViewModel, coordinator: self)
+            likeVC.goToFeedHandler = { [weak self] in self?.popToHome() }
+            self.navigationController.pushViewController(likeVC, animated: true)
+        })
     }
+
     func showSave() {
-        let saveVC = SaveViewController()
-        saveVC.goToFeedHandler = { [weak self] in self?.popToHome() }
-        navigationController.pushViewController(saveVC, animated: true)
+        sideMenu?.dismissMenu(completion: { [weak self] in
+            self?.showSave(folderId: nil)
+        })
     }
+
     func showUnderline() {
-        let underlineVC = UnderlineViewController()
+        sideMenu?.dismissMenu(completion: { [weak self] in
+            guard let self = self else { return }
+            let underlineVM = self.container.makeUnderlineViewModel()
+            let underlineVC = UnderlineViewController(viewModel: underlineVM, coordinator: self)
+            underlineVC.goToFeedHandler = { [weak self] in self?.popToHome() }
+            self.navigationController.pushViewController(underlineVC, animated: true)
+        })
+    }
+
+    func showUnderlineFromPlayer() {
+        // Player에서 직접 Underline 화면으로 이동 (사이드 메뉴 없이)
+        let underlineVM = container.makeUnderlineViewModel()
+        let underlineVC = UnderlineViewController(viewModel: underlineVM, coordinator: self)
         underlineVC.goToFeedHandler = { [weak self] in self?.popToHome() }
         navigationController.pushViewController(underlineVC, animated: true)
     }
+
     func showRecord() {
-        let recordVC = RecordViewController()
-        recordVC.goToFeedHandler = { [weak self] in self?.popToHome() }
-        navigationController.pushViewController(recordVC, animated: true)
+        sideMenu?.dismissMenu(completion: { [weak self] in
+            guard let self = self else { return }
+            let recordVM = self.container.makeRecordViewModel()
+            let recordVC = RecordViewController(viewModel: recordVM, coordinator: self)
+            recordVC.goToRecordHandler = { [weak self] in
+                self?.showRecordInput()
+            }
+            self.navigationController.pushViewController(recordVC, animated: true)
+        })
     }
-    // 홈으로 이동 (예시)
-    private func popToHome() {
+
+    func logout() {
+        print("🚪 AppCoordinator: 로그아웃 처리 시작")
+
+        let logoutUseCase = LogoutUseCaseImpl()
+        var cancellable: AnyCancellable?
+
+        cancellable = logoutUseCase.execute()
+            .receive(on: DispatchQueue.main)
+            .sink(
+                receiveCompletion: { [weak self] completion in
+                    if case .failure(let error) = completion {
+                        print("❌ AppCoordinator: 로그아웃 실패 - \(error.localizedDescription)")
+                        self?.showLogoutError()
+                    }
+                    cancellable?.cancel()
+                },
+                receiveValue: { [weak self] _ in
+                    print("✅ AppCoordinator: 로그아웃 성공 - 로그인 화면으로 이동")
+                    ToastManager.shared.showSuccess("로그아웃되었습니다")
+                    self?.sideMenu?.dismissMenu(completion: {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            self?.navigateToLaunch()
+                        }
+                    })
+                }
+            )
+    }
+
+    // MARK: - LikeCoordinating (showEntry already defined)
+
+    // MARK: - RecordCoordinating
+
+    func showRecordInput() {
+        let recordInputVC = RecordInputViewController()
+        recordInputVC.onRecordSaved = { (recordItem: RecordItemModel) in
+            print("📝 [AppCoordinator] 전시 기록이 저장되었습니다: \(recordItem.exhibitionName)")
+        }
+        recordInputVC.onDismiss = {
+            print("📝 [AppCoordinator] 전시 기록 입력 취소")
+        }
+        recordInputVC.modalPresentationStyle = UIModalPresentationStyle.fullScreen
+        navigationController.present(recordInputVC, animated: true)
+    }
+
+    func popToHome() {
         navigationController.popToRootViewController(animated: true)
     }
-}
 
-// MARK: - SidebarViewControllerDelegate 구현
-extension AppCoordinator: SidebarViewControllerDelegate {
+    // MARK: - UnderlineCoordinating (showPlayer, popToHome already defined)
+
+    // MARK: - SidebarViewControllerDelegate
+
     func sidebarDidRequestClose() {
-        sideMenu?.dismissMenu()
+        closeSidebar()
     }
+
     func sidebarDidRequestShowLike() {
-        sideMenu?.dismissMenu(completion: { [weak self] in self?.showLike() })
+        showLike()
     }
+
     func sidebarDidRequestShowSave() {
-        sideMenu?.dismissMenu(completion: { [weak self] in self?.showSave() })
+        showSave()
     }
+
     func sidebarDidRequestShowUnderline() {
-        sideMenu?.dismissMenu(completion: { [weak self] in self?.showUnderline() })
+        showUnderline()
     }
+
     func sidebarDidRequestShowRecord() {
-        sideMenu?.dismissMenu(completion: { [weak self] in self?.showRecord() })
+        showRecord()
+    }
+
+    func sidebarDidRequestLogout() {
+        logout()
+    }
+
+    // MARK: - Private Helper Methods
+
+    private func showLogoutError() {
+        let alert = UIAlertController(
+            title: "로그아웃 실패",
+            message: "로그아웃 중 오류가 발생했습니다.\n다시 시도해주세요.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "확인", style: .default))
+        navigationController.present(alert, animated: true)
+    }
+
+    @objc private func handleForceLogout() {
+        print("🚨 강제 로그아웃 - 토큰 만료")
+
+        if let sideMenu = sideMenu {
+            sideMenu.dismissMenu(completion: { [weak self] in
+                self?.navigateToLaunch()
+            })
+        } else {
+            navigateToLaunch()
+        }
+    }
+
+    private func navigateToLaunch() {
+        let launchViewModel = LaunchViewModel()
+        let launchVC = LaunchViewController(viewModel: launchViewModel, coordinator: self)
+        navigationController.setViewControllers([launchVC], animated: true)
     }
 }
